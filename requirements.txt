@@ -19,3 +19,4 @@ sentence-transformers
 jupyter
 autopep8
 optuna
+xmltodict

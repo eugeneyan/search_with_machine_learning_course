@@ -77,7 +77,3 @@ if __name__ == '__main__':
         with open(output_file, 'w') as output:
             for i, row in filtered_label_df.iterrows():
                 output.write(f'__label__{row["cat"]} {row["name"]}\n')
-            
-            # for label_list in all_labels:
-            #     for (cat, name) in label_list:
-            #         output.write(f'__label__{cat} {name}\n')
