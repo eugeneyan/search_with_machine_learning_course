@@ -5,6 +5,8 @@ from tqdm import tqdm
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import pandas as pd
+from itertools import chain
 
 def transform_name(product_name):
     # IMPLEMENT
@@ -63,7 +65,19 @@ if __name__ == '__main__':
     print("Writing results to %s" % output_file)
     with multiprocessing.Pool() as p:
         all_labels = tqdm(p.imap(_label_filename, files), total=len(files))
+        all_labels = list(chain.from_iterable(all_labels))  # Flattern list of lists
+        
+        # Convert to dataframe and filter products with less than min product count per category        
+        label_df = pd.DataFrame(all_labels, columns=['cat', 'name'])
+        label_agg = label_df.groupby('cat').agg({'name': 'count'}).reset_index()
+        filtered_categories = set(label_agg.loc[label_agg['name'] > min_products, 'cat'].to_list())
+        filtered_label_df = label_df[label_df['cat'].isin(filtered_categories)]
+        print(f'Category count: {len(filtered_categories)}, Product count: {filtered_label_df.shape[0]:,}')
+        
         with open(output_file, 'w') as output:
-            for label_list in all_labels:
-                for (cat, name) in label_list:
-                    output.write(f'__label__{cat} {name}\n')
+            for i, row in filtered_label_df.iterrows():
+                output.write(f'__label__{row["cat"]} {row["name"]}\n')
+            
+            # for label_list in all_labels:
+            #     for (cat, name) in label_list:
+            #         output.write(f'__label__{cat} {name}\n')
