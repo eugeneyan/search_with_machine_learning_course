@@ -11,11 +11,19 @@ from urllib.parse import urljoin
 import pandas as pd
 import fileinput
 import logging
+import fasttext
+
+from logger import logger
 
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logging.basicConfig(format='%(levelname)s:%(message)s')
+# logger = logging.getLogger(__name__)
+# logger.setLevel(logging.INFO)
+# logging.basicConfig(format='%(levelname)s:%(message)s')
+
+# Import trained model. Set k_preds (number of predictions) and prob_threshold (probability threshold).
+query_classifier: fasttext.FastText._FastText = fasttext.load_model('/workspace/models/query_classifier.bin')
+k_preds = 5
+prob_threshold = 0.5
 
 # expects clicks and impressions to be in the row
 def create_prior_queries_from_group(
@@ -49,7 +57,13 @@ def create_prior_queries(doc_ids, doc_id_weights,
 
 
 # Hardcoded query here.  Better to use search templates or other query config.
-def create_query(user_query, click_prior_query, filters, sort="_score", sortDir="desc", size=10, source=None):
+def create_query(user_query, click_prior_query, filters, sort="_score", sortDir="desc", size=10, source=None, synonyms=False):
+    if synonyms:
+        name_field = 'name.synonyms'
+        logger.info('Querying via synonyms')
+    else:
+        name_field = 'name'
+    
     query_obj = {
         'size': size,
         "sort": [
@@ -65,7 +79,7 @@ def create_query(user_query, click_prior_query, filters, sort="_score", sortDir=
                         "should": [  #
                             {
                                 "match": {
-                                    "name": {
+                                    name_field : {
                                         "query": user_query,
                                         "fuzziness": "1",
                                         "prefix_length": 2,
@@ -89,7 +103,7 @@ def create_query(user_query, click_prior_query, filters, sort="_score", sortDir=
                                     "type": "phrase",
                                     "slop": "6",
                                     "minimum_should_match": "2<75%",
-                                    "fields": ["name^10", "name.hyphens^10", "shortDescription^5",
+                                    "fields": [f"{name_field}^10", "name.hyphens^10", "shortDescription^5",
                                                "longDescription^5", "department^0.5", "sku", "manufacturer", "features",
                                                "categoryPath"]
                                 }
@@ -112,7 +126,7 @@ def create_query(user_query, click_prior_query, filters, sort="_score", sortDir=
                             }
                         ],
                         "minimum_should_match": 1,
-                        "filter": filters  #
+                        "filter": filters  # Filters are added
                     }
                 },
                 "boost_mode": "multiply",  # how _score and functions are combined
@@ -180,22 +194,51 @@ def create_query(user_query, click_prior_query, filters, sort="_score", sortDir=
         try:
             query_obj["query"] = {"match_all": {}}
         except:
-            print("Couldn't replace query for *")
+            logger.info("Couldn't replace query for *")
     if source is not None:  # otherwise use the default and retrieve all source
         query_obj["_source"] = source
+            
     return query_obj
 
 
-def search(client, user_query, index="bbuy_products", sort="_score", sortDir="desc"):
-    #### W3: classify the query
+def search(client, user_query, index="bbuy_products", sort="_score", sortDir="desc", synonyms=False, query_filter=False):
+    #### W3: classify the query and select categories up to the probability threshold
+    filters = None
+    if query_filter:
+        query_categories, scores = query_classifier.predict(user_query, k=k_preds)
+        logger.info(f'Classification result: {query_categories}, {scores}')
+        
+        cum_prob = 0
+        category_list = []
+
+        for category, score in zip(query_categories, scores):
+            logger.info(f'Category: {category}, Score: {score}')
+            
+            category_list.append(category.replace('__label__', ''))
+            cum_prob += score
+            
+            if cum_prob > prob_threshold:
+                break
+        logger.info(f'Category list: {category_list}, Cumulative probability: {cum_prob}')
+        
     #### W3: create filters and boosts
+    # Add query category as a filter (Note: The filters are part of the bool query in the query_obj, where query_obj["query"]["bool"]["filter"]])
+    # https://www.elastic.co/guide/en/elasticsearch/reference/7.17/query-dsl-bool-query.html
+        filters = [
+                {'terms': {'categoryPathIds': category_list}}  # We can pass a list: https://stackoverflow.com/a/48616917/3611239
+        ]
+    
     # Note: you may also want to modify the `create_query` method above
-    query_obj = create_query(user_query, click_prior_query=None, filters=None, sort=sort, sortDir=sortDir, source=["name", "shortDescription"])
-    logging.info(query_obj)
+    query_obj = create_query(user_query, click_prior_query=None, filters=filters, sort=sort, sortDir=sortDir, synonyms=synonyms, source=['name', 'shortDescription', 'categoryPathIds', 'image'])
+    logger.debug(query_obj)
     response = client.search(query_obj, index=index)
+    logger.debug(f'Response: {response}')
     if response and response['hits']['hits'] and len(response['hits']['hits']) > 0:
         hits = response['hits']['hits']
-        print(json.dumps(response, indent=2))
+        logger.debug(json.dumps(response, indent=2))
+        
+    return response
+
 
 
 if __name__ == "__main__":
@@ -212,6 +255,13 @@ if __name__ == "__main__":
                          help='The OpenSearch port')
     general.add_argument('--user',
                          help='The OpenSearch admin.  If this is set, the program will prompt for password too. If not set, use default of admin/admin')
+    general.add_argument('--query', type=str, default='ipod',
+                         help='The query to search.')
+    general.add_argument('--synonyms', default=False, action='store_true',
+                         help='Searches via the name.synonyms field instead of name.')
+    general.add_argument('--query_filter', default=False, action='store_true',
+                         help='Filters via the results from query classification.')
+
 
     args = parser.parse_args()
 
@@ -224,6 +274,8 @@ if __name__ == "__main__":
     if args.user:
         password = getpass()
         auth = (args.user, password)
+    synonyms = args.synonyms
+    query_filter = args.query_filter
 
     base_url = "https://{}:{}/".format(host, port)
     opensearch = OpenSearch(
@@ -236,17 +288,15 @@ if __name__ == "__main__":
         verify_certs=False,  # set to true if you have certs
         ssl_assert_hostname=False,
         ssl_show_warn=False,
-
     )
     index_name = args.index
-    query_prompt = "\nEnter your query (type 'Exit' to exit or hit ctrl-c):"
-    print(query_prompt)
-    for line in fileinput.input():
-        query = line.rstrip()
-        if query == "Exit":
-            break
-        search(client=opensearch, user_query=query, index=index_name)
+    query = args.query
+    # query_prompt = "\nEnter your query (type 'Exit' to exit or hit ctrl-c):"
+    # print(query_prompt)
+    # for line in fileinput.input():
+    #     query = line.rstrip()
+    #     if query == "Exit":
+    #         break
+    search(client=opensearch, user_query=query, index=index_name, synonyms=synonyms, query_filter=query_filter)
 
-        print(query_prompt)
-
-    
+    # print(query_prompt)
